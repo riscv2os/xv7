@@ -27,22 +27,17 @@
 
 //
 // send one character to the uart.
+// called by printf(), and to echo input characters,
+// but not from write().
 //
 void
 consputc(int c)
 {
-  extern volatile int panicked; // from printf.c
-
-  if(panicked){
-    for(;;)
-      ;
-  }
-
   if(c == BACKSPACE){
     // if the user typed backspace, overwrite with a space.
-    uartputc('\b'); uartputc(' '); uartputc('\b');
+    uartputc_sync('\b'); uartputc_sync(' '); uartputc_sync('\b');
   } else {
-    uartputc(c);
+    uartputc_sync(c);
   }
 }
 
@@ -50,31 +45,50 @@ struct {
   struct spinlock lock;
   
   // input
-#define INPUT_BUF 128
-  char buf[INPUT_BUF];
+#define INPUT_BUF_SIZE 128
+  char buf[INPUT_BUF_SIZE];
   uint r;  // Read index
   uint w;  // Write index
   uint e;  // Edit index
 } cons;
 
+static int console_raw = 0;
+static int console_echo = 1;
+
+// Set console mode. raw/echo: 0 disable, 1 enable, -1 keep.
+// Returns previous mode as bitmask: bit0=raw, bit1=echo.
+int
+consolemode(int raw, int echo)
+{
+  int prev;
+
+  acquire(&cons.lock);
+  prev = (console_raw ? 1 : 0) | (console_echo ? 2 : 0);
+  if(raw >= 0)
+    console_raw = raw ? 1 : 0;
+  if(echo >= 0)
+    console_echo = echo ? 1 : 0;
+  release(&cons.lock);
+
+  return prev;
+}
+
 //
 // user write()s to the console go here.
 //
 int
-consolewrite(struct file *f, int user_src, uint64 src, int n)
+consolewrite(int user_src, uint64 src, int n)
 {
   int i;
 
-  acquire(&cons.lock);
   for(i = 0; i < n; i++){
     char c;
     if(either_copyin(&c, user_src, src+i, 1) == -1)
       break;
-    consputc(c);
+    uartputc(c);
   }
-  release(&cons.lock);
 
-  return n;
+  return i;
 }
 
 //
@@ -84,7 +98,7 @@ consolewrite(struct file *f, int user_src, uint64 src, int n)
 // or kernel address.
 //
 int
-consoleread(struct file *f, int user_dst, uint64 dst, int n)
+consoleread(int user_dst, uint64 dst, int n)
 {
   uint target;
   int c;
@@ -96,36 +110,47 @@ consoleread(struct file *f, int user_dst, uint64 dst, int n)
     // wait until interrupt handler has put some
     // input into cons.buffer.
     while(cons.r == cons.w){
-      if(myproc()->killed){
+      if(killed(myproc())){
         release(&cons.lock);
         return -1;
       }
       sleep(&cons.r, &cons.lock);
     }
 
-    c = cons.buf[cons.r++ % INPUT_BUF];
+    c = cons.buf[cons.r++ % INPUT_BUF_SIZE];
 
-    if(c == C('D')){  // end-of-file
-      if(n < target){
-        // Save ^D for next time, to make sure
-        // caller gets a 0-byte result.
-        cons.r--;
+    if(console_raw){
+      // copy the input byte to the user-space buffer.
+      cbuf = c;
+      if(either_copyout(user_dst, dst, &cbuf, 1) == -1)
+        break;
+      dst++;
+      --n;
+      if(cons.r == cons.w)
+        break;
+    } else {
+      if(c == C('D')){  // end-of-file
+        if(n < target){
+          // Save ^D for next time, to make sure
+          // caller gets a 0-byte result.
+          cons.r--;
+        }
+        break;
       }
-      break;
-    }
 
-    // copy the input byte to the user-space buffer.
-    cbuf = c;
-    if(either_copyout(user_dst, dst, &cbuf, 1) == -1)
-      break;
+      // copy the input byte to the user-space buffer.
+      cbuf = c;
+      if(either_copyout(user_dst, dst, &cbuf, 1) == -1)
+        break;
 
-    dst++;
-    --n;
+      dst++;
+      --n;
 
-    if(c == '\n'){
-      // a whole line has arrived, return to
-      // the user-level read().
-      break;
+      if(c == '\n'){
+        // a whole line has arrived, return to
+        // the user-level read().
+        break;
+      }
     }
   }
   release(&cons.lock);
@@ -144,35 +169,48 @@ consoleintr(int c)
 {
   acquire(&cons.lock);
 
+  if(console_raw){
+    if(c != 0 && cons.e-cons.r < INPUT_BUF_SIZE){
+      c = (c == '\r') ? '\n' : c;
+      if(console_echo)
+        consputc(c);
+      cons.buf[cons.e++ % INPUT_BUF_SIZE] = c;
+      cons.w = cons.e;
+      wakeup(&cons.r);
+    }
+    release(&cons.lock);
+    return;
+  }
+
   switch(c){
   case C('P'):  // Print process list.
     procdump();
     break;
   case C('U'):  // Kill line.
     while(cons.e != cons.w &&
-          cons.buf[(cons.e-1) % INPUT_BUF] != '\n'){
+          cons.buf[(cons.e-1) % INPUT_BUF_SIZE] != '\n'){
       cons.e--;
       consputc(BACKSPACE);
     }
     break;
   case C('H'): // Backspace
-  case '\x7f':
+  case '\x7f': // Delete key
     if(cons.e != cons.w){
       cons.e--;
       consputc(BACKSPACE);
     }
     break;
   default:
-    if(c != 0 && cons.e-cons.r < INPUT_BUF){
+    if(c != 0 && cons.e-cons.r < INPUT_BUF_SIZE){
       c = (c == '\r') ? '\n' : c;
 
       // echo back to the user.
       consputc(c);
 
       // store for consumption by consoleread().
-      cons.buf[cons.e++ % INPUT_BUF] = c;
+      cons.buf[cons.e++ % INPUT_BUF_SIZE] = c;
 
-      if(c == '\n' || c == C('D') || cons.e == cons.r+INPUT_BUF){
+      if(c == '\n' || c == C('D') || cons.e-cons.r == INPUT_BUF_SIZE){
         // wake up consoleread() if a whole line (or end-of-file)
         // has arrived.
         cons.w = cons.e;

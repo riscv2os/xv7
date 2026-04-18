@@ -5,13 +5,13 @@
 #include "spinlock.h"
 #include "proc.h"
 #include "defs.h"
-#include "sleeplock.h"
-#include "fs.h"
-#include "file.h"
-#include "fcntl.h"
+#include "softirq.h"
 
 struct spinlock tickslock;
 uint ticks;
+
+struct spinlock pendinglock;
+uint64 pending;
 
 extern char trampoline[], uservec[], userret[];
 
@@ -20,13 +20,11 @@ void kernelvec();
 
 extern int devintr();
 
-static const char *
-scause_desc(uint64 stval);
-
 void
 trapinit(void)
 {
   initlock(&tickslock, "time");
+  initlock(&pendinglock, "softirq");
 }
 
 // set up to take exceptions and traps while in the kernel.
@@ -55,81 +53,32 @@ usertrap(void)
   struct proc *p = myproc();
   
   // save user program counter.
-  p->tf->epc = r_sepc();
+  p->trapframe->epc = r_sepc();
   
   if(r_scause() == 8){
     // system call
 
-    if(p->killed)
+    if(killed(p))
       exit(-1);
 
     // sepc points to the ecall instruction,
     // but we want to return to the next instruction.
-    p->tf->epc += 4;
+    p->trapframe->epc += 4;
 
-    // an interrupt will change sstatus &c registers,
-    // so don't enable until done with those registers.
+    // an interrupt will change sepc, scause, and sstatus,
+    // so enable only now that we're done with those registers.
     intr_on();
 
     syscall();
   } else if((which_dev = devintr()) != 0){
     // ok
-  } else if(r_scause() == 13 || r_scause() == 15) { // ccc:mmap
-    // 13 for load page fault, 15 for store page fault
-    uint64 fault_vaddr = r_stval();
-    if(fault_vaddr >= MMAP_VSTART && fault_vaddr < MMAP_VEND) {
-      pagetable_t pagetable = p->pagetable;
-      uint64 vpage_base = PGROUNDDOWN(fault_vaddr);
-      int map_sel = (vpage_base - MMAP_VSTART) / MMAP_SIZE;
-      struct map_info *map = &p->minfo[map_sel];
-      uint64 map_start = map->vstart;
-
-      // check for invalid mapping & access
-      if(map->used == 0 || fault_vaddr >= map->vend) {
-        printf("usertrap(): segfault pid=%d epc=%p\n", p->pid, r_sepc());
-        p->killed = 1;
-        goto end;
-      }
-
-      uint64 file_start = vpage_base - map_start;
-      uint64 read_length = PGSIZE;
-      if(read_length > map->length - file_start)
-        read_length = map->length - file_start;
-      
-      struct file *f = map->file;
-      int prot = ((map->prot & PROT_READ) ? PTE_R : 0) | ((map->prot & PROT_WRITE) ? PTE_W : 0);
-
-      char *mem = kalloc();
-      if(mem == 0) {
-        printf("usertrap(): segfault: no more physical page available, killing process due to a OOM\n");
-        p->killed = 1;
-        goto end;
-      }
-
-      memset(mem, 0, PGSIZE);
-      ilock(f->ip);
-      readi(f->ip, 0, (uint64)mem, file_start, read_length);
-      iunlock(f->ip);
-
-      if(mappages(pagetable, vpage_base, PGSIZE, (uint64)mem, prot|PTE_U) != 0){
-        printf("usertrap(): segfault: cannot map a page");
-        kfree(mem);
-        p->killed = 1;
-        goto end;
-      }
-    } else {
-      printf("usertrap(): unexpected scause %p (%s) pid=%d\n", r_scause(), scause_desc(r_scause()), p->pid);
-      printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-      p->killed = 1;
-    }
   } else {
-    printf("usertrap(): unexpected scause %p (%s) pid=%d\n", r_scause(), scause_desc(r_scause()), p->pid);
-    printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
-    p->killed = 1;
+    printf("usertrap(): unexpected scause 0x%lx pid=%d\n", r_scause(), p->pid);
+    printf("            sepc=0x%lx stval=0x%lx\n", r_sepc(), r_stval());
+    setkilled(p);
   }
 
-end:
-  if(p->killed)
+  if(killed(p))
     exit(-1);
 
   // give up the CPU if this is a timer interrupt.
@@ -147,19 +96,21 @@ usertrapret(void)
 {
   struct proc *p = myproc();
 
-  // turn off interrupts, since we're switching
-  // now from kerneltrap() to usertrap().
+  // we're about to switch the destination of traps from
+  // kerneltrap() to usertrap(), so turn off interrupts until
+  // we're back in user space, where usertrap() is correct.
   intr_off();
 
-  // send syscalls, interrupts, and exceptions to trampoline.S
-  w_stvec(TRAMPOLINE + (uservec - trampoline));
+  // send syscalls, interrupts, and exceptions to uservec in trampoline.S
+  uint64 trampoline_uservec = TRAMPOLINE + (uservec - trampoline);
+  w_stvec(trampoline_uservec);
 
   // set up trapframe values that uservec will need when
-  // the process next re-enters the kernel.
-  p->tf->kernel_satp = r_satp();         // kernel page table
-  p->tf->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
-  p->tf->kernel_trap = (uint64)usertrap;
-  p->tf->kernel_hartid = r_tp();         // hartid for cpuid()
+  // the process next traps into the kernel.
+  p->trapframe->kernel_satp = r_satp();         // kernel page table
+  p->trapframe->kernel_sp = p->kstack + PGSIZE; // process's kernel stack
+  p->trapframe->kernel_trap = (uint64)usertrap;
+  p->trapframe->kernel_hartid = r_tp();         // hartid for cpuid()
 
   // set up the registers that trampoline.S's sret will use
   // to get to user space.
@@ -171,16 +122,16 @@ usertrapret(void)
   w_sstatus(x);
 
   // set S Exception Program Counter to the saved user pc.
-  w_sepc(p->tf->epc);
+  w_sepc(p->trapframe->epc);
 
   // tell trampoline.S the user page table to switch to.
   uint64 satp = MAKE_SATP(p->pagetable);
 
-  // jump to trampoline.S at the top of memory, which 
+  // jump to userret in trampoline.S at the top of memory, which 
   // switches to the user page table, restores user registers,
   // and switches to user mode with sret.
-  uint64 fn = TRAMPOLINE + (userret - trampoline);
-  ((void (*)(uint64,uint64))fn)(TRAPFRAME, satp);
+  uint64 trampoline_userret = TRAMPOLINE + (userret - trampoline);
+  ((void (*)(uint64))trampoline_userret)(satp);
 }
 
 // interrupts and exceptions from kernel code go here via kernelvec,
@@ -199,13 +150,13 @@ kerneltrap()
     panic("kerneltrap: interrupts enabled");
 
   if((which_dev = devintr()) == 0){
-    printf("scause %p (%s)\n", scause, scause_desc(scause));
-    printf("sepc=%p stval=%p\n", r_sepc(), r_stval());
+    // interrupt or trap from an unknown source
+    printf("scause=0x%lx sepc=0x%lx stval=0x%lx\n", scause, r_sepc(), r_stval());
     panic("kerneltrap");
   }
 
   // give up the CPU if this is a timer interrupt.
-  if(which_dev == 2 && myproc() != 0 && myproc()->state == RUNNING)
+  if(which_dev == 2 && myproc() != 0)
     yield();
 
   // the yield() may have caused some traps to occur,
@@ -217,10 +168,36 @@ kerneltrap()
 void
 clockintr()
 {
-  acquire(&tickslock);
-  ticks++;
-  wakeup(&ticks);
-  release(&tickslock);
+  if(cpuid() == 0){
+    acquire(&tickslock);
+    ticks++;
+    wakeup(&ticks);
+    release(&tickslock);
+    net_timer_handler();
+  }
+
+  // ask for the next timer interrupt. this also clears
+  // the interrupt request. 1000000 is about a tenth
+  // of a second.
+  w_stimecmp(r_time() + 1000000);
+}
+
+void
+softintr()
+{
+  acquire(&pendinglock);
+  uint64 irqs = pending;
+  pending = 0;
+  release(&pendinglock);
+
+  if(irqs & SOFT_IRQ_NET_RX) {
+    net_softirq_handler();
+  }
+  if(irqs & SOFT_IRQ_NET_EVENT) {
+    net_event_handler();
+  }
+
+  w_sip(r_sip() & ~SIP_SSIP);
 }
 
 // check if it's an external interrupt or software interrupt,
@@ -233,8 +210,7 @@ devintr()
 {
   uint64 scause = r_scause();
 
-  if((scause & 0x8000000000000000L) &&
-     (scause & 0xff) == 9){
+  if(scause == 0x8000000000000009L){
     // this is a supervisor external interrupt, via PLIC.
 
     // irq indicates which device interrupted.
@@ -242,97 +218,31 @@ devintr()
 
     if(irq == UART0_IRQ){
       uartintr();
-    } else if(irq == VIRTIO0_IRQ || irq == VIRTIO1_IRQ ){
-      virtio_disk_intr(irq - VIRTIO0_IRQ);
-    } else if(irq == E1000_IRQ){
-      e1000_intr();
-    } else {
-      // the PLIC sends each device interrupt to every core,
-      // which generates a lot of interrupts with irq==0.
+    } else if(irq == VIRTIO0_IRQ){
+      virtio_disk_intr();
+    } else if(irq == VIRTIO1_IRQ){
+      virtio_net_intr();
+    } else if(irq){
+      printf("unexpected interrupt irq=%d\n", irq);
     }
 
+    // the PLIC allows each device to raise at most one
+    // interrupt at a time; tell the PLIC the device is
+    // now allowed to interrupt again.
     if(irq)
       plic_complete(irq);
 
     return 1;
   } else if(scause == 0x8000000000000001L){
-    // software interrupt from a machine-mode timer interrupt,
-    // forwarded by timervec in kernelvec.S.
-
-    if(cpuid() == 0){
-      clockintr();
-    }
-    
-    // acknowledge the software interrupt by clearing
-    // the SSIP bit in sip.
-    w_sip(r_sip() & ~2);
-
+    // software interrupt.
+    softintr();
+    return 1;
+  } else if(scause == 0x8000000000000005L){
+    // timer interrupt.
+    clockintr();
     return 2;
   } else {
     return 0;
   }
 }
 
-static const char *
-scause_desc(uint64 stval)
-{
-  static const char *intr_desc[16] = {
-    [0] "user software interrupt",
-    [1] "supervisor software interrupt",
-    [2] "<reserved for future standard use>",
-    [3] "<reserved for future standard use>",
-    [4] "user timer interrupt",
-    [5] "supervisor timer interrupt",
-    [6] "<reserved for future standard use>",
-    [7] "<reserved for future standard use>",
-    [8] "user external interrupt",
-    [9] "supervisor external interrupt",
-    [10] "<reserved for future standard use>",
-    [11] "<reserved for future standard use>",
-    [12] "<reserved for future standard use>",
-    [13] "<reserved for future standard use>",
-    [14] "<reserved for future standard use>",
-    [15] "<reserved for future standard use>",
-  };
-  static const char *nointr_desc[16] = {
-    [0] "instruction address misaligned",
-    [1] "instruction access fault",
-    [2] "illegal instruction",
-    [3] "breakpoint",
-    [4] "load address misaligned",
-    [5] "load access fault",
-    [6] "store/AMO address misaligned",
-    [7] "store/AMO access fault",
-    [8] "environment call from U-mode",
-    [9] "environment call from S-mode",
-    [10] "<reserved for future standard use>",
-    [11] "<reserved for future standard use>",
-    [12] "instruction page fault",
-    [13] "load page fault",
-    [14] "<reserved for future standard use>",
-    [15] "store/AMO page fault",
-  };
-  uint64 interrupt = stval & 0x8000000000000000L;
-  uint64 code = stval & ~0x8000000000000000L;
-  if (interrupt) {
-    if (code < NELEM(intr_desc)) {
-      return intr_desc[code];
-    } else {
-      return "<reserved for platform use>";
-    }
-  } else {
-    if (code < NELEM(nointr_desc)) {
-      return nointr_desc[code];
-    } else if (code <= 23) {
-      return "<reserved for future standard use>";
-    } else if (code <= 31) {
-      return "<reserved for custom use>";
-    } else if (code <= 47) {
-      return "<reserved for future standard use>";
-    } else if (code <= 63) {
-      return "<reserved for custom use>";
-    } else {
-      return "<reserved for future standard use>";
-    }
-  }
-}

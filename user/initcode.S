@@ -1,4 +1,4 @@
-# Initial process execs /init.
+# Initial process that execs /init.
 # This code runs in user space.
 
 #include "syscall.h"
@@ -24,5 +24,5 @@ init:
 # char *argv[] = { init, 0 };
 .p2align 2
 argv:
-  .long init
-  .long 0
+  .quad init
+  .quad 0

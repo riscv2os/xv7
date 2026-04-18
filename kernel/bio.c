@@ -28,7 +28,8 @@ struct {
   struct buf buf[NBUF];
 
   // Linked list of all buffers, through prev/next.
-  // head.next is most recently used.
+  // Sorted by how recently the buffer was used.
+  // head.next is most recent, head.prev is least.
   struct buf head;
 } bcache;
 
@@ -71,7 +72,8 @@ bget(uint dev, uint blockno)
     }
   }
 
-  // Not cached; recycle an unused buffer.
+  // Not cached.
+  // Recycle the least recently used (LRU) unused buffer.
   for(b = bcache.head.prev; b != &bcache.head; b = b->prev){
     if(b->refcnt == 0) {
       b->dev = dev;
@@ -94,7 +96,7 @@ bread(uint dev, uint blockno)
 
   b = bget(dev, blockno);
   if(!b->valid) {
-    virtio_disk_rw(b->dev, b, 0);
+    virtio_disk_rw(b, 0);
     b->valid = 1;
   }
   return b;
@@ -106,11 +108,11 @@ bwrite(struct buf *b)
 {
   if(!holdingsleep(&b->lock))
     panic("bwrite");
-  virtio_disk_rw(b->dev, b, 1);
+  virtio_disk_rw(b, 1);
 }
 
 // Release a locked buffer.
-// Move to the head of the MRU list.
+// Move to the head of the most-recently-used list.
 void
 brelse(struct buf *b)
 {

@@ -1,15 +1,13 @@
 struct file {
-  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE, FD_SOCK } type;
+  enum { FD_NONE, FD_PIPE, FD_INODE, FD_DEVICE, FD_SOCKET } type;
   int ref; // reference count
   char readable;
   char writable;
-  struct net *net;   // FD_NET
   struct pipe *pipe; // FD_PIPE
   struct inode *ip;  // FD_INODE and FD_DEVICE
-  struct sock *sock; // FD_SOCK
-  uint off;          // FD_INODE and FD_DEVICE
+  struct socket *socket; // FD_SOCKET
+  uint off;          // FD_INODE
   short major;       // FD_DEVICE
-  short minor;       // FD_DEVICE
 };
 
 #define major(dev)  ((dev) >> 16 & 0xFFFF)
@@ -29,16 +27,15 @@ struct inode {
   short minor;
   short nlink;
   uint size;
-  uint addrs[NDIRECT+2];
+  uint addrs[NDIRECT+1];
 };
 
 // map major device number to device functions.
 struct devsw {
-  int (*read)(struct file *, int, uint64, int);
-  int (*write)(struct file *, int, uint64, int);
+  int (*read)(int, uint64, int);
+  int (*write)(int, uint64, int);
 };
 
 extern struct devsw devsw[];
 
-#define DISK 0
 #define CONSOLE 1

@@ -1,57 +1,103 @@
-[中文電子書 -- 從 RISC-V 處理器到 UNIX 作業系統](https://github.com/riscv2os/riscv2os/wiki)
+xv6-riscv-net
+=======
 
-xv7 作業系統是擴充自 [xv6-riscv](xv6) 的一個教學型作業系統，但預計會做下列延伸：
+This project integrates a TCP/IP protocol stack into the [xv6-riscv](https://github.com/mit-pdos/xv6-riscv) operating system, enabling network capabilities.
 
-1. xv7: tcp/ip/ethernet 網路堆疊
-2. xv7: mmap 共用記憶體
-3. xv7: 擴大檔案大小限制 -- 加入雙層間接連結
-4. xv7: 加入一個小型的 c 語言編譯器 (c4)
-5. xv7: 加入一個小型的編輯器 (kilo) -- (未完成)
-6. xv7: 加入 telnet 的功能 -- (未完成)
+Key Components:
 
+- **TCP/IP Stack**: A kernel-space port of [microps](https://github.com/pandax381/microps), a user-mode TCP/IP stack that I am also developing.
 
-## xv6 原始聲明
+- **Network Driver**: A virtio-net driver for network device emulation in QEMU.
 
-xv6 is a re-implementation of Dennis Ritchie's and Ken Thompson's Unix
-Version 6 (v6).  xv6 loosely follows the structure and style of v6,
-but is implemented for a modern RISC-V multiprocessor using ANSI C.
+- **Socket API**: A standard socket interface for network applications.
 
-ACKNOWLEDGMENTS
+- **Network Configuration**: A simple `ifconfig` command for basic network settings.
 
-xv6 is inspired by John Lions's Commentary on UNIX 6th Edition (Peer
-to Peer Communications; ISBN: 1-57398-013-7; 1st edition (June 14,
-2000)). See also https://pdos.csail.mit.edu/6.828/, which
-provides pointers to on-line resources for v6.
+![screenshot](./doc/screenshot.png)
 
-The following people have made contributions: Russ Cox (context switching,
-locking), Cliff Frey (MP), Xiao Yu (MP), Nickolai Zeldovich, and Austin
-Clements.
+## Quick Start
 
-We are also grateful for the bug reports and patches contributed by
-Silas Boyd-Wickizer, Anton Burtsev, Dan Cross, Cody Cutler, Mike CAT,
-Tej Chajed, eyalz800, Nelson Elhage, Saar Ettinger, Alice Ferrazzi,
-Nathaniel Filardo, Peter Froehlich, Yakir Goaron,Shivam Handa, Bryan
-Henry, Jim Huang, Alexander Kapshuk, Anders Kaseorg, kehao95, Wolfgang
-Keller, Eddie Kohler, Austin Liew, Imbar Marinescu, Yandong Mao, Matan
-Shabtay, Hitoshi Mitake, Carmi Merimovich, Mark Morrissey, mtasm, Joel
-Nider, Greg Price, Ayan Shafqat, Eldar Sehayek, Yongming Shen, Cam
-Tenny, tyfkda, Rafael Ubal, Warren Toomey, Stephen Tu, Pablo Ventura,
-Xi Wang, Keiichi Watanabe, Nicolas Wolovick, wxdao, Grant Wu, Jindong
-Zhang, Icenowy Zheng, and Zou Chang Wei.
+### 1. Build and Run
 
-The code in the files that constitute xv6 is
-Copyright 2006-2019 Frans Kaashoek, Robert Morris, and Russ Cox.
+Clone the repository and use the `make qemu` command.
 
-ERROR REPORTS
+```shell
+$ git clone https://github.com/pandax381/xv6-riscv-net
+$ cd xv6-riscv-net
+$ make qemu
+```
 
-Please send errors and suggestions to Frans Kaashoek and Robert Morris
-(kaashoek,rtm@mit.edu). The main purpose of xv6 is as a teaching
-operating system for MIT's 6.828, so we are more interested in
-simplifications and clarifications than new features.
+> [!NOTE]
+> This command will build the project and launch QEMU. On the first run, it will also create a TAP network device named `tap0` on your host machine and assign it the IP address `192.0.2.1/24`. This enables network communication between the xv6 guest and the host.
 
-BUILDING AND RUNNING XV6
+### 2. Network Configuration in xv6
 
-You will need a RISC-V "newlib" tool chain from
-https://github.com/riscv/riscv-gnu-toolchain, and qemu compiled for
-riscv64-softmmu. Once they are installed, and in your shell
-search path, you can run "make qemu".
+Once xv6 has booted, use the `ifconfig` command to configure the `net0` network interface. We'll assign it the IP address `192.0.2.2`, as the host is using `192.0.2.1`.
+
+```shell
+$ ifconfig net0 192.0.2.2 netmask 255.255.255.0
+```
+
+After setting the IP address, run the `ifconfig` command again to verify that the network settings have been applied.
+
+```shell
+$ ifconfig
+net0: flags=93<UP|BROADCAST|RUNNING|NEEDARP> mtu 1500
+        ether 52:54:00:12:34:56
+        inet 192.0.2.2 netmask 255.255.255.0 broadcast 192.0.2.255
+```
+
+The setup is now complete. You can verify the communication by pinging the xv6 guest from a terminal on your host machine.
+
+```shell
+$ ping 192.0.2.2
+PING 192.0.2.2 (192.0.2.2) 56(84) bytes of data.
+64 bytes from 192.0.2.2: icmp_seq=1 ttl=255 time=0.444 ms
+...
+```
+
+### 3. Running the Sample Programs
+
+This project includes `tcpecho` and `udpecho` as sample user-level applications to demonstrate the network stack. Here is how to test the TCP echo server.
+
+In the xv6 shell, run the `tcpecho` command. It will start a server listening on port `7`.
+
+```shell
+$ tcpecho
+Starting TCP Echo Server
+socket: success, soc=3
+bind: success, self=0.0.0.0:7
+waiting for connection...
+```
+
+Open a new terminal on your host machine and use `nc` (netcat) to connect to the tcpecho server running inside QEMU.
+
+```
+$ nc -v 192.0.2.2 7
+```
+
+Once the connection succeeds, type any message into the `nc` terminal and press Enter. The message will be sent to the xv6 `tcpecho` server, which will then echo it back to your terminal.
+
+```
+Connection to 192.0.2.2 7 port [tcp/echo] succeeded!
+hoge
+hoge
+fuga
+fuga
+```
+
+On the xv6 guest, `tcpecho` will output messages like the following after a connection is established and data is received:
+
+```
+accept: success, peer=192.0.2.1:33680
+recv: 5 bytes data received
+> hoge
+recv: 5 bytes data received
+> fuga
+```
+
+## License
+
+xv6-riscv: Under the MIT License. See [LICENSE](./LICENSE) file.
+
+Additional code: Under the MIT License.

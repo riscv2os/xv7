@@ -76,11 +76,11 @@ fileclose(struct file *f)
   if(ff.type == FD_PIPE){
     pipeclose(ff.pipe, ff.writable);
   } else if(ff.type == FD_INODE || ff.type == FD_DEVICE){
-    begin_op(ff.ip->dev);
+    begin_op();
     iput(ff.ip);
-    end_op(ff.ip->dev);
-  } else if(ff.type == FD_SOCK) {
-    sockclose(ff.sock);
+    end_op();
+  } else if(ff.type == FD_SOCKET){
+    socket_close(ff.socket);
   }
 }
 
@@ -118,14 +118,12 @@ fileread(struct file *f, uint64 addr, int n)
   } else if(f->type == FD_DEVICE){
     if(f->major < 0 || f->major >= NDEV || !devsw[f->major].read)
       return -1;
-    r = devsw[f->major].read(f, 1, addr, n);
+    r = devsw[f->major].read(1, addr, n);
   } else if(f->type == FD_INODE){
     ilock(f->ip);
     if((r = readi(f->ip, 1, addr, f->off, n)) > 0)
       f->off += r;
     iunlock(f->ip);
-  } else if(f->type == FD_SOCK) {
-    r = sockread(f->sock, addr, n);
   } else {
     panic("fileread");
   }
@@ -148,7 +146,7 @@ filewrite(struct file *f, uint64 addr, int n)
   } else if(f->type == FD_DEVICE){
     if(f->major < 0 || f->major >= NDEV || !devsw[f->major].write)
       return -1;
-    ret = devsw[f->major].write(f, 1, addr, n);
+    ret = devsw[f->major].write(1, addr, n);
   } else if(f->type == FD_INODE){
     // write a few blocks at a time to avoid exceeding
     // the maximum log transaction size, including
@@ -163,22 +161,20 @@ filewrite(struct file *f, uint64 addr, int n)
       if(n1 > max)
         n1 = max;
 
-      begin_op(f->ip->dev);
+      begin_op();
       ilock(f->ip);
       if ((r = writei(f->ip, 1, addr + i, f->off, n1)) > 0)
         f->off += r;
       iunlock(f->ip);
-      end_op(f->ip->dev);
+      end_op();
 
-      if(r < 0)
+      if(r != n1){
+        // error from writei
         break;
-      if(r != n1)
-        panic("short filewrite");
+      }
       i += r;
     }
     ret = (i == n ? n : -1);
-  } else if(f->type == FD_SOCK) {
-    r = sockwrite(f->sock, addr, n);
   } else {
     panic("filewrite");
   }

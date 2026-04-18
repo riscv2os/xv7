@@ -5,6 +5,7 @@
 #include <fcntl.h>
 #include <assert.h>
 
+#define MKFS 1
 #define stat xv6_stat  // avoid clash with host struct stat
 #include "kernel/types.h"
 #include "kernel/fs.h"
@@ -15,20 +16,18 @@
 #define static_assert(a, b) do { switch (0) case 0: case (a): ; } while (0)
 #endif
 
-#define bzero1(buf, size) memset(buf, 0, size)
-
 #define NINODES 200
 
 // Disk layout:
 // [ boot block | sb block | log | inode blocks | free bit map | data blocks ]
 
-int nbitmap = FSSIZE/(BSIZE*8) + 1;
+int nbitmap = FSSIZE/BPB + 1;
 int ninodeblocks = NINODES / IPB + 1;
 int nlog = LOGSIZE;
 int nmeta;    // Number of meta blocks (boot, sb, nlog, inode, bitmap)
 int nblocks;  // Number of data blocks
 
-FILE *fsfd; // int fsfd;
+int fsfd;
 struct superblock sb;
 char zeroes[BSIZE];
 uint freeinode = 1;
@@ -42,8 +41,9 @@ void rinode(uint inum, struct dinode *ip);
 void rsect(uint sec, void *buf);
 uint ialloc(ushort type);
 void iappend(uint inum, void *p, int n);
+void die(const char *);
 
-// convert to intel byte order
+// convert to riscv byte order
 ushort
 xshort(ushort x)
 {
@@ -69,7 +69,7 @@ xint(uint x)
 int
 main(int argc, char *argv[])
 {
-  int i, cc; FILE *fd; // ccc: int i, cc, fd;
+  int i, cc, fd;
   uint rootino, inum, off;
   struct dirent de;
   char buf[BSIZE];
@@ -86,11 +86,9 @@ main(int argc, char *argv[])
   assert((BSIZE % sizeof(struct dinode)) == 0);
   assert((BSIZE % sizeof(struct dirent)) == 0);
 
-  fsfd = fopen(argv[1], "wb+"); // ccc: fsfd = open(argv[1], O_RDWR|O_CREAT|O_TRUNC, 0666);
-  if(fsfd < 0){
-    perror(argv[1]);
-    exit(1);
-  }
+  fsfd = open(argv[1], O_RDWR|O_CREAT|O_TRUNC, 0666);
+  if(fsfd < 0)
+    die(argv[1]);
 
   // 1 fs block = 1 disk sector
   nmeta = 2 + nlog + ninodeblocks + nbitmap;
@@ -120,33 +118,28 @@ main(int argc, char *argv[])
   rootino = ialloc(T_DIR);
   assert(rootino == ROOTINO);
 
-  bzero1(&de, sizeof(de));
+  bzero(&de, sizeof(de));
   de.inum = xshort(rootino);
   strcpy(de.name, ".");
   iappend(rootino, &de, sizeof(de));
 
-  bzero1(&de, sizeof(de));
+  bzero(&de, sizeof(de));
   de.inum = xshort(rootino);
   strcpy(de.name, "..");
   iappend(rootino, &de, sizeof(de));
 
   for(i = 2; i < argc; i++){
     // get rid of "user/"
-    char *namep = strchr(argv[i], '/');
-    char *shortname = namep ? namep+1 : argv[i];
-    // shortname = argv[i];
-    /*
+    char *shortname;
     if(strncmp(argv[i], "user/", 5) == 0)
       shortname = argv[i] + 5;
     else
       shortname = argv[i];
-    */
-    assert(strchr(shortname, '/') == 0); // assert(index(shortname, '/') == 0); 
+    
+    assert(index(shortname, '/') == 0);
 
-    if((fd = fopen(argv[i], "rb+")) == NULL){ // ccc: if((fd = open(argv[i], 0)) < 0){
-      perror(argv[i]);
-      exit(1);
-    }
+    if((fd = open(argv[i], 0)) < 0)
+      die(argv[i]);
 
     // Skip leading _ in name when writing to file system.
     // The binaries are named _rm, _cat, etc. to keep the
@@ -155,16 +148,19 @@ main(int argc, char *argv[])
     if(shortname[0] == '_')
       shortname += 1;
 
+    assert(strlen(shortname) <= DIRSIZ);
+    
     inum = ialloc(T_FILE);
 
-    bzero1(&de, sizeof(de));
+    bzero(&de, sizeof(de));
     de.inum = xshort(inum);
     strncpy(de.name, shortname, DIRSIZ);
     iappend(rootino, &de, sizeof(de));
 
-    while((cc = fread(buf, 1, sizeof(buf), fd)) > 0) // ccc: while((cc = read(fd, buf, sizeof(buf))) > 0)
+    while((cc = read(fd, buf, sizeof(buf))) > 0)
       iappend(inum, buf, cc);
-    fclose(fd); // close(fd);
+
+    close(fd);
   }
 
   // fix size of root inode dir
@@ -182,14 +178,10 @@ main(int argc, char *argv[])
 void
 wsect(uint sec, void *buf)
 {
-  if(fseek(fsfd, sec * BSIZE, SEEK_SET)!=0){ // ccc: if(lseek(fsfd, sec * BSIZE, 0) != sec * BSIZE){
-    perror("lseek");
-    exit(1);
-  }
-  if(fwrite(buf, 1, BSIZE, fsfd) != BSIZE){ // ccc: if(write(fsfd, buf, BSIZE) != BSIZE){
-    perror("write");
-    exit(1);
-  }
+  if(lseek(fsfd, sec * BSIZE, 0) != sec * BSIZE)
+    die("lseek");
+  if(write(fsfd, buf, BSIZE) != BSIZE)
+    die("write");
 }
 
 void
@@ -222,15 +214,10 @@ rinode(uint inum, struct dinode *ip)
 void
 rsect(uint sec, void *buf)
 {
-  if(fseek(fsfd, sec * BSIZE, SEEK_SET)!=0){ // ccc: if(lseek(fsfd, sec * BSIZE, 0) != sec * BSIZE){
-    perror("lseek");
-    exit(1);
-  }
-  if(fread(buf, 1, BSIZE, fsfd) != BSIZE){ // ccc:if(read(fsfd, buf, BSIZE) != BSIZE){
-    perror("read");
-    printf("rsect error: read size != BSIZE\n");
-    exit(1);
-  }
+  if(lseek(fsfd, sec * BSIZE, 0) != sec * BSIZE)
+    die("lseek");
+  if(read(fsfd, buf, BSIZE) != BSIZE)
+    die("read");
 }
 
 uint
@@ -239,7 +226,7 @@ ialloc(ushort type)
   uint inum = freeinode++;
   struct dinode din;
 
-  bzero1(&din, sizeof(din));
+  bzero(&din, sizeof(din));
   din.type = xshort(type);
   din.nlink = xshort(1);
   din.size = xint(0);
@@ -254,8 +241,8 @@ balloc(int used)
   int i;
 
   printf("balloc: first %d blocks have been allocated\n", used);
-  assert(used < BSIZE*8);
-  bzero1(buf, BSIZE);
+  assert(used < BPB);
+  bzero(buf, BSIZE);
   for(i = 0; i < used; i++){
     buf[i/8] = buf[i/8] | (0x1 << (i%8));
   }
@@ -299,7 +286,7 @@ iappend(uint inum, void *xp, int n)
     }
     n1 = min(n, (fbn + 1) * BSIZE - off);
     rsect(x, buf);
-    memmove(buf + off - (fbn * BSIZE), p, n1);  // memcpy(buf + off - (fbn * BSIZE), p, n1); // ccc: bcopy(p, buf + off - (fbn * BSIZE), n1);
+    bcopy(p, buf + off - (fbn * BSIZE), n1);
     wsect(x, buf);
     n -= n1;
     off += n1;
@@ -307,4 +294,11 @@ iappend(uint inum, void *xp, int n)
   }
   din.size = xint(off);
   winode(inum, &din);
+}
+
+void
+die(const char *s)
+{
+  perror(s);
+  exit(1);
 }

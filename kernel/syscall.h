@@ -20,11 +20,14 @@
 #define SYS_link   19
 #define SYS_mkdir  20
 #define SYS_close  21
-#define SYS_connect 22
-
-// System calls for labs
-#define SYS_ntas   23
-
-// ccc:mmap
-#define SYS_mmap 24
-#define SYS_munmap 25
+#define SYS_socket 22
+#define SYS_bind   23
+#define SYS_recvfrom 24
+#define SYS_sendto 25
+#define SYS_connect 26
+#define SYS_listen 27
+#define SYS_accept 28
+#define SYS_recv   29
+#define SYS_send   30
+#define SYS_ioctl  31
+#define SYS_consolemode 32
