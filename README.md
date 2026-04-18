@@ -1,103 +1,88 @@
-xv6-riscv-net
-=======
+xv7
+===
 
-This project integrates a TCP/IP protocol stack into the [xv6-riscv](https://github.com/mit-pdos/xv6-riscv) operating system, enabling network capabilities.
+xv7 是基於 xv6-riscv 的 Unix 風格作業系統，額外新增了 TCP/IP 網路功能。
 
-Key Components:
+## 系統架構
 
-- **TCP/IP Stack**: A kernel-space port of [microps](https://github.com/pandax381/microps), a user-mode TCP/IP stack that I am also developing.
+```
+┌─────────────────────────────────────────────────────────┐
+│                    使用者空間                            │
+│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐        │
+│  │ tcpecho │ │ httpd   │ │ telnetd │ │ curl    │        │
+│  └─────────┘ └─────────┘ └─────────┘ └─────────┘        │
+├─────────────────────────────────────────────────────────┤
+│                    系統呼叫                              │
+│  open, read, write, fork, exec, pipe, socket, connect     │
+├─────────────────────────────────────────────────────────┤
+│                    核心空間                              │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
+│  │ 行程管理    │ │ 檔案系統    │ │ 網路堆疊    │        │
+│  │             │ │ (SFS)       │ │             │        │
+│  └─────────────┘ └─────────────┘ └─────────────┘        │
+│  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐        │
+│  │ 記憶體管理  │ │ 裝置驅動    │ │ VirtIO      │        │
+│  │             │ │            │ │ 網路/磁碟   │        │
+│  └─────────────┘ └─────────────┘ └─────────────┘        │
+└─────────────────────────────────────────────────────────┘
+```
 
-- **Network Driver**: A virtio-net driver for network device emulation in QEMU.
+## 環境需求
 
-- **Socket API**: A standard socket interface for network applications.
+- **Linux**：本專案必須在 Linux 環境下執行（macOS 不支援）
+- **QEMU**：安裝 qemu-system-riscv64
+- **RISC-V Toolchain**：交叉編譯工具
 
-- **Network Configuration**: A simple `ifconfig` command for basic network settings.
-
-![screenshot](./doc/screenshot.png)
-
-## Quick Start
-
-### 1. Build and Run
-
-Clone the repository and use the `make qemu` command.
+### 安裝方法（Ubuntu/Debian）
 
 ```shell
-$ git clone https://github.com/pandax381/xv6-riscv-net
-$ cd xv6-riscv-net
-$ make qemu
+sudo apt update
+sudo apt install -y build-essential gcc-riscv64-unknown-elf binutils-riscv64-unknown-elf
+sudo apt install -y qemu-system-misc
 ```
 
-> [!NOTE]
-> This command will build the project and launch QEMU. On the first run, it will also create a TAP network device named `tap0` on your host machine and assign it the IP address `192.0.2.1/24`. This enables network communication between the xv6 guest and the host.
-
-### 2. Network Configuration in xv6
-
-Once xv6 has booted, use the `ifconfig` command to configure the `net0` network interface. We'll assign it the IP address `192.0.2.2`, as the host is using `192.0.2.1`.
+### 安裝方法（Fedora/RHEL）
 
 ```shell
-$ ifconfig net0 192.0.2.2 netmask 255.255.255.0
+sudo dnf install -y riscv64-unknown-elf-gcc riscv64-unknown-elf-binutils
+sudo dnf install -y qemu-system-riscv
 ```
 
-After setting the IP address, run the `ifconfig` command again to verify that the network settings have been applied.
+## 編譯與執行
 
 ```shell
-$ ifconfig
-net0: flags=93<UP|BROADCAST|RUNNING|NEEDARP> mtu 1500
-        ether 52:54:00:12:34:56
-        inet 192.0.2.2 netmask 255.255.255.0 broadcast 192.0.2.255
+make qemu          # 編譯核心 + fs.img，執行 QEMU（需要 sudo 建立 tap0）
+make qemu NET=user   # 使用者模式網路，無需 sudo
+make qemu NET=none   # 無網路設備
+make clean        # 清除編譯產物
 ```
 
-The setup is now complete. You can verify the communication by pinging the xv6 guest from a terminal on your host machine.
+QEMU 預設使用 3 顆 CPU：`make qemu CPUS=1`
 
+## 網路設定
+
+在 xv7 內設定網路介面：
 ```shell
-$ ping 192.0.2.2
-PING 192.0.2.2 (192.0.2.2) 56(84) bytes of data.
-64 bytes from 192.0.2.2: icmp_seq=1 ttl=255 time=0.444 ms
-...
+ifconfig net0 192.0.2.2 netmask 255.255.255.0
 ```
 
-### 3. Running the Sample Programs
-
-This project includes `tcpecho` and `udpecho` as sample user-level applications to demonstrate the network stack. Here is how to test the TCP echo server.
-
-In the xv6 shell, run the `tcpecho` command. It will start a server listening on port `7`.
-
+測試網路功能：
 ```shell
-$ tcpecho
-Starting TCP Echo Server
-socket: success, soc=3
-bind: success, self=0.0.0.0:7
-waiting for connection...
+tcpecho    # 啟動 TCP Echo 伺服器（連接 port 7）
+udpecho    # 啟動 UDP Echo 伺服器（連接 port 7）
 ```
 
-Open a new terminal on your host machine and use `nc` (netcat) to connect to the tcpecho server running inside QEMU.
+## 元件位置
 
-```
-$ nc -v 192.0.2.2 7
-```
+| 元件 | 路徑 |
+|------|------|
+| 行程管理 | `kernel/proc.c`, `kernel/proc.h` |
+| 記憶體管理 | `kernel/vm.c`, `kernel/kalloc.c` |
+| 檔案系統 | `kernel/fs.c`, `kernel/bio.c` |
+| 網路堆疊 | `kernel/net/` |
+| 裝置驅動 | `kernel/virtio_disk.c`, `kernel/uart.c` |
 
-Once the connection succeeds, type any message into the `nc` terminal and press Enter. The message will be sent to the xv6 `tcpecho` server, which will then echo it back to your terminal.
+## 授權
 
-```
-Connection to 192.0.2.2 7 port [tcp/echo] succeeded!
-hoge
-hoge
-fuga
-fuga
-```
-
-On the xv6 guest, `tcpecho` will output messages like the following after a connection is established and data is received:
-
-```
-accept: success, peer=192.0.2.1:33680
-recv: 5 bytes data received
-> hoge
-recv: 5 bytes data received
-> fuga
-```
-
-## License
-
-xv6-riscv: Under the MIT License. See [LICENSE](./LICENSE) file.
-
-Additional code: Under the MIT License.
+xv6-riscv: MIT License
+其他程式碼: MIT License
